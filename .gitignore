@@ -1,0 +1,111 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+*.pdb
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# --- Virtual Environments ---
+venv/
+.env/
+.env.bak
+.venv/
+env/
+ENV/
+venv.bak/
+.conda/
+*.virtualenv
+
+# --- Environment & API Keys ---
+# (Never commit secrets like Telegram or OpenAI keys)
+.env
+.env.local
+.env.production
+.env.dev
+*.env
+
+# --- IDE & Editor Config ---
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# --- Logs & Runtime ---
+*.log
+*.out
+*.err
+nohup.out
+debug.log
+.log/
+logs/
+*.sqlite3
+instance/
+.DS_Store
+
+# --- OS & Misc ---
+Thumbs.db
+.DS_Store
+Icon?
+__MACOSX/
+
+# --- Uvicorn / FastAPI ---
+*.db
+*.sqlite
+*.pid
+*.sock
+
+# --- Ngrok / Tunnels ---
+ngrok.yml
+ngrok.log
+*.ngrok.log
+*.ngrok-debug.log
+
+# --- Temporary Files ---
+*.tmp
+*.bak
+*.swp
+*.swo
+*.old
+
+# --- Project-specific ---
+# Cached analysis outputs
+/cache/
+output/
+reports/
+uploads/
+data/
+temp/
+tests/__pycache__/
+
+# --- PyInstaller ---
+*.manifest
+*.spec
+
+# --- Jupyter / Notebooks (if you experiment locally) ---
+.ipynb_checkpoints/
+*.ipynb
+
+# --- macOS ---
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# --- Python coverage / testing ---
+.coverage
+htmlcov/
+.tox/
+.nox/
+.pytest_cache/
+.cache/
+coverage.xml
+nosetests.xml
+test-results.xml
+
+# --- VSCode local history / metadata ---
+.history/
+.vscode/
