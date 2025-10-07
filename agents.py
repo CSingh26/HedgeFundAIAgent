@@ -12,23 +12,18 @@ if not OPENAI_API_KEY:
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 def hedge_fund_agents(symbol, market_data, news_data):
-    """Combine insights from multiple legendary investor personas"""
+    """Combine insights from multiple legendary investor personas."""
     try:
         print(f"🤖 Running AI hedge fund analysis for {symbol}")
 
-        context = {
-            "symbol": symbol,
-            "market_summary": str(market_data)[:5000],
-            "news_summary": str(news_data)[:3000]
-        }
-
         prompt = f"""
-        You are a panel of hedge fund managers (Warren Buffett, Ray Dalio, Bill Ackman, Steve Cohen, and Charlie Munger).
+        You are a panel of hedge fund managers (Warren Buffett, Ray Dalio, Bill Ackman, Steve Cohen, Charlie Munger).
         Evaluate the stock {symbol}.
-        1. Discuss market trends and risk exposure.
-        2. Assess recent news impact.
-        3. Give a short-term and long-term outlook.
-        4. Conclude with an investment decision and risk level.
+        1) Market trends & risk exposure
+        2) Recent news impact
+        3) Short-term vs long-term outlook
+        4) Final recommendation with a risk level (1-10) and brief rationale
+        Use numbered structure and be concise.
         """
 
         response = client.chat.completions.create(
@@ -47,24 +42,26 @@ def hedge_fund_agents(symbol, market_data, news_data):
         print(f"[ERROR] Hedge fund agent failed: {e}")
         return {"error": str(e)}
 
+
 def risk_manager(analysis):
-    """Run final risk assessment"""
+    """Run final risk assessment (LLM)."""
     try:
         symbol = analysis.get("symbol")
         text = analysis.get("analysis", "")
 
         prompt = f"""
-        Based on this analysis of {symbol}, estimate:
+        Based on the following analysis for {symbol}, output:
         - Risk rating (1–10)
-        - Suggested portfolio allocation (%)
-        - Recommended hedging strategy
+        - Suggested portfolio allocation (%) by conviction
+        - Hedging idea (index hedge or options)
+        Keep it short and structured.
         """
 
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": "You are a risk manager analyzing portfolio exposure."},
-                {"role": "user", "content": prompt + "\n" + text}
+                {"role": "user", "content": prompt + "\n\n" + text}
             ]
         )
 
