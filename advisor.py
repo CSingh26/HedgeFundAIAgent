@@ -2,6 +2,7 @@
 import os
 import time
 from collections import defaultdict
+from math import sqrt
 
 import numpy as np
 import pandas as pd
@@ -9,21 +10,20 @@ import requests
 import yfinance as yf
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+from scipy.stats import norm  # pip install scipy
 
 load_dotenv()
 
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
 FMP_API_KEY     = os.getenv("FMP_API_KEY")
 
-
 # =========================
-# Generic helpers
+# Helpers
 # =========================
 def _safe_get_json(url):
     try:
         r = requests.get(url, timeout=20)
         r.raise_for_status()
-        # Some providers return raw JSON arrays; ensure dict or list is fine
         return r.json()
     except Exception as e:
         print(f"[advisor] GET failed: {url} -> {e}")
@@ -33,44 +33,35 @@ def chunked(lst, n):
     for i in range(0, len(lst), n):
         yield lst[i:i+n]
 
-
 # =========================
 # Universe providers
 # =========================
 def get_sp500_list():
-    """
-    Try FMP (if available); otherwise scrape Slickcharts (free HTML).
-    Returns ~300 tickers to keep the workflow responsive.
-    """
-    # --- Try FMP first ---
+    # Try FMP
     if FMP_API_KEY:
         url = f"https://financialmodelingprep.com/api/v3/sp500_constituent?apikey={FMP_API_KEY}"
         data = _safe_get_json(url)
         if isinstance(data, list) and data and "error" not in data:
-            tickers = [x.get("symbol") for x in data if x.get("symbol")]
-            if tickers:
-                return tickers
-
-    # --- Fallback: Slickcharts ---
+            t = [x.get("symbol") for x in data if x.get("symbol")]
+            if t:
+                return t
+    # Fallback Slickcharts
     try:
         html = requests.get("https://www.slickcharts.com/sp500", timeout=20).text
         soup = BeautifulSoup(html, "html.parser")
         table = soup.find("table", {"class": "table"})
         tickers = []
         for row in table.tbody.find_all("tr"):
-            # Ticker is in column index 2
             t = row.find_all("td")[2].get_text(strip=True)
             tickers.append(t)
         tickers = list(dict.fromkeys(tickers))[:300]
         return tickers
     except Exception as e:
         print(f"[advisor] Slickcharts fallback failed: {e}")
-        # Last-ditch tiny universe
         return ["AAPL","MSFT","NVDA","GOOGL","AMZN","META","BRK.B","UNH","XOM","JPM","V","HD","LLY","PG"]
 
-
 # =========================
-# Fundamentals (optional; tolerant to 403)
+# Fundamentals (optional)
 # =========================
 def get_profile_fmp(symbol):
     if not FMP_API_KEY:
@@ -122,20 +113,19 @@ def get_ratios_fmp_batch(symbols):
         print(f"[advisor] FMP ratios batch failed: {e}")
     return out
 
-
 # =========================
 # Prices & OHLCV
 # =========================
 def get_last_price(symbol):
     """
-    Robust last price:
-    1) Polygon prev close (usually allowed on free plans)
+    Robust last price in USD terms where possible:
+    1) Polygon previous close
     2) FMP quote-short
     3) yfinance last close
     """
     sym = symbol.upper()
 
-    # 1) Polygon 'prev'
+    # Polygon prev
     try:
         if POLYGON_API_KEY:
             url_prev = f"https://api.polygon.io/v2/aggs/ticker/{sym}/prev?adjusted=true&apiKey={POLYGON_API_KEY}"
@@ -149,7 +139,7 @@ def get_last_price(symbol):
     except Exception as e:
         print(f"[advisor] Polygon prev failed for {sym}: {e}")
 
-    # 2) FMP quote-short
+    # FMP quote-short
     try:
         if FMP_API_KEY:
             url_fmp = f"https://financialmodelingprep.com/api/v3/quote-short/{sym}?apikey={FMP_API_KEY}"
@@ -161,7 +151,7 @@ def get_last_price(symbol):
     except Exception as e:
         print(f"[advisor] FMP quote failed for {sym}: {e}")
 
-    # 3) yfinance last close
+    # yfinance last close
     try:
         y = yf.Ticker(sym).history(period="2d", auto_adjust=False)
         if not y.empty:
@@ -173,12 +163,7 @@ def get_last_price(symbol):
 
     return None
 
-
 def fetch_hist_ohlcv(tickers, period="1y"):
-    """
-    Return (close_df, volume_df) with columns=tickers.
-    Handles both single and multi-ticker shapes from yfinance.
-    """
     if isinstance(tickers, str):
         tickers = [tickers]
 
@@ -190,7 +175,6 @@ def fetch_hist_ohlcv(tickers, period="1y"):
         auto_adjust=False,
         threads=True
     )
-
     if df.empty:
         return pd.DataFrame(), pd.DataFrame()
 
@@ -198,14 +182,12 @@ def fetch_hist_ohlcv(tickers, period="1y"):
         close = df["Adj Close"] if "Adj Close" in df.columns.levels[0] else df["Close"]
         vol   = df["Volume"]
     else:
-        # Single ticker
         close = df[["Adj Close"]] if "Adj Close" in df.columns else df[["Close"]]
         vol   = df[["Volume"]]
         close.columns = [tickers[0]]
         vol.columns   = [tickers[0]]
 
     return close.dropna(how="all"), vol.dropna(how="all")
-
 
 # =========================
 # Risk / Signals
@@ -251,48 +233,109 @@ def compute_momentum_vol(prices_df: pd.DataFrame):
     return stats
 
 def decide_action(pnl_pct, momentum_3m, drawdown_recent):
-    """
-    Heuristic decision:
-      - If >= +25% P/L and momentum fading or drawdown risk rising -> DIVERSIFY
-      - If <= -20% P/L or momentum nasty + drawdown poor -> EXIT
-      - Else HOLD
-    """
     if pnl_pct >= 0.25 and (momentum_3m < 0.0 or drawdown_recent < -0.10):
         return "DIVERSIFY"
     if pnl_pct <= -0.20 or (momentum_3m < -0.05 and drawdown_recent < -0.12):
         return "EXIT"
     return "HOLD"
 
+# =========================
+# Forecasting & Ratings
+# =========================
+def compute_return_stats(price_series: pd.Series):
+    s = price_series.dropna()
+    rets = np.log(s / s.shift(1)).dropna()
+    if len(rets) < 30:
+        mu_d = rets.mean() if len(rets) else 0.0003
+        sig_d = rets.std(ddof=1) if len(rets) else 0.015
+    else:
+        mu_d = rets.mean()
+        sig_d = rets.std(ddof=1)
+    mu_ann = float(mu_d * 252)
+    sigma_ann = float(sig_d * sqrt(252))
+    mu_63d = float(mu_d * 63)
+    sigma_63d = float(sig_d * sqrt(63))
+    return dict(mu_ann=mu_ann, sigma_ann=sigma_ann, mu_63d=mu_63d, sigma_63d=sigma_63d)
+
+def forecast_range(last_price: float, mu_ann: float, sigma_ann: float, days: int, p_low=0.10, p_high=0.90):
+    T = days / 252.0
+    mu = mu_ann
+    sigma = sigma_ann
+    mid = last_price * float(np.exp(mu * T))
+    z_low = norm.ppf(p_low); z_high = norm.ppf(p_high)
+    drift = (mu - 0.5 * sigma * sigma) * T
+    volterm = sigma * sqrt(T)
+    low = last_price * float(np.exp(drift + volterm * z_low))
+    high = last_price * float(np.exp(drift + volterm * z_high))
+    return dict(low=round(low, 2), mid=round(mid, 2), high=round(high, 2))
+
+def projections_bull_bear(last_price: float, stats: dict):
+    mu = stats["mu_ann"]; sig = stats["sigma_ann"]
+    mu_bull = mu + 0.5 * sig; sig_bull = max(0.0001, sig * 0.9)
+    mu_bear = mu - 0.5 * sig; sig_bear = sig * 1.1
+    return {
+        "3m": {
+            "bull": forecast_range(last_price, mu_bull, sig_bull, 63),
+            "bear": forecast_range(last_price, mu_bear, sig_bear, 63),
+        },
+        "6m": {
+            "bull": forecast_range(last_price, mu_bull, sig_bull, 126),
+            "bear": forecast_range(last_price, mu_bear, sig_bear, 126),
+        }
+    }
+
+def horizon_rating(stats: dict, mom_3m: float, drawdown_min: float, risk_level: str):
+    mu = stats["mu_ann"]
+    sig = max(1e-6, stats["sigma_ann"])
+    sharpe_like = mu / sig
+    mom = mom_3m
+    dd_penalty = drawdown_min
+    score = 0.6 * sharpe_like + 0.3 * (mom * 5) + 0.1 * (dd_penalty * 5)
+    r = (risk_level or "balanced").lower()
+    if r == "conservative":
+        score -= 0.15 * max(0, sig - 0.25)
+    elif r == "aggressive":
+        score += 0.10 * (sig)
+
+    def bucket(x):
+        if x >= 1.0: return ("Optimal", "High conviction; favorable reward vs. risk.")
+        if x >= 0.3: return ("Reasonable", "Acceptable; be selective on entries.")
+        return ("Avoid", "Unfavorable risk-adjusted outlook.")
+
+    q_score = score + 0.1 * mom
+    s_score = score + 0.05 * sharpe_like
+    q_label, q_note = bucket(q_score)
+    s_label, s_note = bucket(s_score)
+    return dict(
+        quarterly=dict(label=q_label, note=q_note, score=round(q_score, 2)),
+        six_month=dict(label=s_label, note=s_note, score=round(s_score, 2)),
+        metrics=dict(sharpe_like=round(sharpe_like, 2), ann_vol=round(sig, 2), ann_mu=round(mu, 2))
+    )
 
 # =========================
-# Dynamic screening (no hard-coded list)
+# Dynamic screening
 # =========================
-def screen_candidates(current_symbol, risk_level="balanced", max_names=15, per_sector_cap=3):
+def screen_candidates(current_symbol, risk_level="balanced", max_names=10, per_sector_cap=2):
     universe = get_sp500_list()
-    # exclude the current symbol itself
     universe = [u for u in universe if u.upper() != current_symbol.upper()]
     if not universe:
         return []
 
-    # Optional fundamentals (tolerant to 403); enriches score if available
-    prof = get_profiles_fmp_batch(universe)
-    ratios = get_ratios_fmp_batch(universe)
+    prof = get_profiles_fmp_batch(universe)   # may be {}
+    ratios = get_ratios_fmp_batch(universe)   # may be {}
 
-    # Limit to a manageable slice for speed
     universe = universe[:250]
     close, vol = fetch_hist_ohlcv(universe, period="1y")
     if close.empty or vol.empty:
         return []
 
-    # Liquidity filter: 30-day ADV (avg dollar volume)
     last_px = close.ffill().iloc[-1]
     avg_vol = vol.rolling(30).mean().iloc[-1]
     adv = (avg_vol * last_px).dropna()
 
-    min_adv = 50e6 if risk_level != "aggressive" else 20e6  # $50M for conservative/balanced, $20M aggressive
+    min_adv = 50e6 if risk_level != "aggressive" else 20e6
     liquid = adv[adv >= min_adv].index.tolist()
     if not liquid:
-        # fallback: top 100 by ADV
         liquid = adv.sort_values(ascending=False).head(100).index.tolist()
 
     prices = close[liquid].dropna(axis=1, how="all")
@@ -301,12 +344,10 @@ def screen_candidates(current_symbol, risk_level="balanced", max_names=15, per_s
 
     stats = compute_momentum_vol(prices)
 
-    # Momentum gate
     keep = []
     for sym in prices.columns:
         s = stats.get(sym, {})
-        m6 = s.get("mom_6m")
-        m12 = s.get("mom_12m")
+        m6 = s.get("mom_6m"); m12 = s.get("mom_12m")
         if m6 is None and m12 is None:
             continue
         if risk_level == "conservative":
@@ -322,35 +363,27 @@ def screen_candidates(current_symbol, risk_level="balanced", max_names=15, per_s
     if not keep:
         keep = list(prices.columns)[:80]
 
-    # Composite score; FMP data augments if present, but not required
     rows = []
     for sym in keep:
         s = stats.get(sym, {})
-        p = prof.get(sym, {})   # may be {}
-        r = ratios.get(sym, {}) # may be {}
+        p = prof.get(sym, {})
+        r = ratios.get(sym, {})
         mcap = p.get("mktCap") or p.get("marketCap") or 0
         m6 = s.get("mom_6m") or 0.0
         m12 = s.get("mom_12m") or 0.0
-        vol_ = s.get("vol")
-        vol_pen = 0.0 if vol_ is None or np.isnan(vol_) else float(vol_)
-
-        # Small quality bonus if available
-        pe = r.get("priceEarningsRatioTTM")
-        margin = r.get("netProfitMarginTTM")
+        vol_ = s.get("vol"); vol_pen = 0.0 if vol_ is None or np.isnan(vol_) else float(vol_)
+        pe = r.get("priceEarningsRatioTTM"); margin = r.get("netProfitMarginTTM")
         q_bonus = 0.0
         if pe and pe > 0 and pe < 40: q_bonus += 0.1
         if margin and margin > 0.10:  q_bonus += 0.1
-
         mom = 0.6*m6 + 0.4*m12
         size = np.log1p(mcap) if mcap else 0.0
         score = 2.0*mom + 0.35*size - 0.75*vol_pen + q_bonus
-
         sector = p.get("sector", "N/A")
         rows.append((sym, score, sector))
 
     rows.sort(key=lambda x: x[1], reverse=True)
 
-    # Sector caps (unknown sectors counted as 'N/A')
     sector_count = defaultdict(int)
     selected = []
     for sym, score, sector in rows:
@@ -363,9 +396,8 @@ def screen_candidates(current_symbol, risk_level="balanced", max_names=15, per_s
 
     return selected
 
-
 # =========================
-# Main entrypoint
+# Main entrypoint for /advise
 # =========================
 def advise_position(symbol, entry_price, shares, risk_level="balanced"):
     symbol = symbol.upper()
@@ -377,7 +409,6 @@ def advise_position(symbol, entry_price, shares, risk_level="balanced"):
     pnl = (last - entry_price) * shares
     pnl_pct = (last / entry_price - 1.0)
 
-    # History for momentum & drawdown
     close, _ = fetch_hist_ohlcv([symbol], period="1y")
     s = close[symbol].dropna() if symbol in close.columns else pd.Series(dtype=float)
     if s.empty:
@@ -387,9 +418,13 @@ def advise_position(symbol, entry_price, shares, risk_level="balanced"):
     rolling_max = s.cummax()
     dd = (s / rolling_max - 1.0).iloc[-63:].min() if len(s) > 63 else (s / s.cummax() - 1.0).min()
 
-    profile = get_profile_fmp(symbol)  # optional
-    ratios  = get_ratios_fmp(symbol)   # optional
+    profile = get_profile_fmp(symbol)
+    ratios  = get_ratios_fmp(symbol)
     sector  = profile.get("sector", "N/A") if profile else "N/A"
+
+    stats = compute_return_stats(s)
+    projections = projections_bull_bear(last, stats)
+    rating = horizon_rating(stats, mom_3m, dd, risk_level)
 
     action = decide_action(pnl_pct, mom_3m, dd)
     rb = risk_budget(risk_level)
@@ -405,15 +440,16 @@ def advise_position(symbol, entry_price, shares, risk_level="balanced"):
         "risk_level": risk_level,
         "sector": sector,
         "action": action,
-        "notes": {}
+        "notes": {},
+        "projections": projections,
+        "rating": rating,
     }
 
     if action in ["DIVERSIFY", "EXIT"]:
         take_out_value = position_value * (0.30 if action == "DIVERSIFY" else 1.00)
-
-        candidates = screen_candidates(symbol, risk_level=risk_level, max_names=15, per_sector_cap=3)
+        candidates = screen_candidates(symbol, risk_level=risk_level, max_names=10, per_sector_cap=2)
         if not candidates:
-            candidates = ["AAPL","MSFT","NVDA","GOOGL","AMZN"]  # last-ditch tiny fallback
+            candidates = ["AAPL","MSFT","NVDA","GOOGL","AMZN"]
         candidates = [c for c in candidates if c.upper() != symbol.upper()]
 
         close_cand, _ = fetch_hist_ohlcv(candidates, period="1y")
@@ -423,7 +459,7 @@ def advise_position(symbol, entry_price, shares, risk_level="balanced"):
             prices = close_cand
 
         w = inverse_vol_weights(prices)
-        w = w.clip(upper=rb["max_pos"])   # per-name cap
+        w = w.clip(upper=rb["max_pos"]).replace([np.inf, -np.inf], 0.0)
         w = w / w.sum()
 
         allocs = (w * take_out_value).round(2).sort_values(ascending=False)
@@ -437,13 +473,12 @@ def advise_position(symbol, entry_price, shares, risk_level="balanced"):
             f"(e.g., inverse ETF or short index futures) or vol targeting."
         )
     else:
-        # Trailing stop heuristic based on realized vol band
         rets = s.pct_change().dropna()
         vol_now = rets.rolling(14).std().iloc[-1] if len(rets) > 14 else (rets.std() if not rets.empty else 0.02)
         trail = max(0.08, min(0.20, float(vol_now) * 3.0))
         recommendation["notes"]["hold_params"] = {
             "suggested_trailing_stop_pct": round(trail * 100, 2),
-            "rationale": "Momentum not deteriorating; maintain position with a disciplined trailing stop."
+            "rationale": "Momentum steady; hold with a disciplined trailing stop."
         }
 
     recommendation["rationale"] = {
@@ -453,7 +488,8 @@ def advise_position(symbol, entry_price, shares, risk_level="balanced"):
         "quality_hint": {
             "pe": ratios.get("priceEarningsRatioTTM") if ratios else None,
             "profit_margin": ratios.get("netProfitMarginTTM") if ratios else None,
-        }
+        },
+        "risk_metrics": rating.get("metrics", {}),
     }
 
     return recommendation

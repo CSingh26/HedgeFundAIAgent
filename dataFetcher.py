@@ -1,68 +1,81 @@
-import requests
-import datetime
+# dataFetcher.py
 import os
+import datetime as dt
+import requests
 from dotenv import load_dotenv
 
-# ✅ Load environment variables
 load_dotenv()
 
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
 
-if not POLYGON_API_KEY:
-    print("⚠️ POLYGON_API_KEY missing. Polygon API calls will fail.")
-if not NEWS_API_KEY:
-    print("⚠️ NEWS_API_KEY missing. NewsAPI calls will fail.")
-
-
-def get_stock_data(symbol):
-    """Fetch historical stock data (year-to-date daily) from Polygon."""
+def _safe_get_json(url):
     try:
-        today = datetime.date.today()
-        start_date = f"{today.year}-01-01"
-        end_date = f"{today.year}-12-31"
-
-        url = (
-            f"https://api.polygon.io/v2/aggs/ticker/{symbol.upper()}/range/1/day/"
-            f"{start_date}/{end_date}?adjusted=true&sort=asc&apiKey={POLYGON_API_KEY}"
-        )
-        response = requests.get(url, timeout=20)
-        response.raise_for_status()
-        data = response.json()
-
-        if "results" not in data:
-            print(f"[ERROR] No data found for {symbol}: {data}")
-            return {"error": f"No data found for {symbol}"}
-
-        print(f"✅ Polygon data fetched for {symbol}")
-        return data
-
+        r = requests.get(url, timeout=20)
+        r.raise_for_status()
+        return r.json()
     except Exception as e:
-        print(f"[ERROR] Request failed for {symbol}: {e}")
+        print(f"[dataFetcher] GET failed: {url} -> {e}")
         return {"error": str(e)}
 
+def get_stock_data(symbol: str):
+    sym = symbol.upper()
+    if not POLYGON_API_KEY:
+        return {"error": "Missing POLYGON_API_KEY"}
 
-def get_news_data(symbol):
-    """Fetch recent news for a given symbol via NewsAPI."""
-    try:
-        today = datetime.date.today()
-        from_date = today - datetime.timedelta(days=7)
-
-        url = (
-            f"https://newsapi.org/v2/everything?q={symbol}&from={from_date}"
-            f"&sortBy=publishedAt&apiKey={NEWS_API_KEY}"
-        )
-        response = requests.get(url, timeout=20)
-        response.raise_for_status()
-        data = response.json()
-
-        if "articles" not in data:
-            print(f"[ERROR] No news found for {symbol}: {data}")
-            return {"error": f"No news found for {symbol}"}
-
-        print(f"📰 News data fetched for {symbol}")
+    end = dt.date.today()
+    start = end - dt.timedelta(days=365)
+    url = (
+        f"https://api.polygon.io/v2/aggs/ticker/{sym}/range/1/day/"
+        f"{start.isoformat()}/{end.isoformat()}?adjusted=true&sort=asc&apiKey={POLYGON_API_KEY}"
+    )
+    data = _safe_get_json(url)
+    if "error" in data:
         return data
-
+    try:
+        results = data.get("results", [])
+        if not results:
+            return {"note": "no polygon results", "raw": data}
+        closes = [r.get("c") for r in results if r.get("c") is not None]
+        highs  = [r.get("h") for r in results if r.get("h") is not None]
+        lows   = [r.get("l") for r in results if r.get("l") is not None]
+        volume = [r.get("v") for r in results if r.get("v") is not None]
+        snap = dict(
+            last_close=closes[-1],
+            ytd_return=round((closes[-1] / closes[0] - 1.0) * 100, 2) if closes else None,
+            high_52w = max(highs) if highs else None,
+            low_52w  = min(lows) if lows else None,
+            avg_vol_30d = int(sum(volume[-30:]) / max(1, len(volume[-30:]))) if volume else None,
+            count=len(results)
+        )
+        return snap
     except Exception as e:
-        print(f"[ERROR] News request failed for {symbol}: {e}")
-        return {"error": str(e)}
+        return {"error": f"parse error: {e}", "raw": data}
+
+def get_news_data(symbol: str):
+    if not NEWS_API_KEY:
+        return {"error": "Missing NEWS_API_KEY"}
+
+    today = dt.datetime.utcnow()
+    from_date = (today - dt.timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    q = symbol.upper()
+    url = (
+        "https://newsapi.org/v2/everything?"
+        f"q={q}&from={from_date}&sortBy=publishedAt&language=en&pageSize=6&apiKey={NEWS_API_KEY}"
+    )
+    data = _safe_get_json(url)
+    if "error" in data:
+        return data
+    try:
+        arts = data.get("articles", [])[:6]
+        clean = []
+        for a in arts:
+            clean.append({
+                "title": a.get("title"),
+                "source": a.get("source", {}).get("name"),
+                "publishedAt": a.get("publishedAt"),
+                "desc": a.get("description")
+            })
+        return {"sample": clean, "count": len(clean)}
+    except Exception as e:
+        return {"error": f"news parse error: {e}", "raw": data}

@@ -1,17 +1,20 @@
-from fastapi import FastAPI, Request
-from telegram import Bot
+# main.py
 import os
 from dotenv import load_dotenv
+from fastapi import FastAPI, Request
+from telegram import Bot
 
-# ✅ Load environment variables
+from agents import hedge_fund_agents, risk_manager
+from dataFetcher import get_stock_data, get_news_data
+from reportFormatter import format_report, format_advice_output
+from advisor import advise_position
+
 load_dotenv()
 
-# ✅ One-time startup log
 print("\n🔍 Loaded Keys Summary:")
 for key in ["TELEGRAM_TOKEN", "POLYGON_API_KEY", "NEWS_API_KEY", "OPENAI_API_KEY", "FMP_API_KEY"]:
     print(f"{key}: {'✅ Loaded' if os.getenv(key) else '❌ Missing'}")
 
-# ✅ Initialize Telegram bot
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 if not TELEGRAM_TOKEN:
     raise ValueError("❌ TELEGRAM_TOKEN missing in .env file")
@@ -19,100 +22,85 @@ if not TELEGRAM_TOKEN:
 bot = Bot(token=TELEGRAM_TOKEN)
 app = FastAPI()
 
-from agents import hedge_fund_agents, risk_manager
-from dataFetcher import get_stock_data, get_news_data
-from advisor import advise_position
-from reportFormatter import format_report, format_advice_output
+def _clean_command(text: str):
+    t = (text or "").strip()
+    if not t:
+        return None, None, {}
+    if t.startswith("/"):
+        parts = t[1:].split()
+        cmd = parts[0].upper()
+        sym = parts[1].upper() if len(parts) > 1 else None
+        args = {}
+        for tok in parts[2:]:
+            if "=" in tok:
+                k, v = tok.split("=", 1)
+                args[k.strip().upper()] = v.strip()
+        return cmd, sym, args
+    return None, t.upper(), {}
 
+async def _send_chunks(chat_id, chunks):
+    # Only send up to 2 chunks, per requirement
+    for c in chunks[:2]:
+        await bot.send_message(chat_id=chat_id, text=c, parse_mode="Markdown")
 
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
     data = await request.json()
     message = data.get("message", {})
     chat_id = message.get("chat", {}).get("id")
-    text = message.get("text", "").strip()
+    text = message.get("text", "")
 
-    if not text:
+    cmd, symbol, args = _clean_command(text)
+
+    if not symbol:
         await bot.send_message(
             chat_id=chat_id,
-            text="⚠️ Please send a command.\nTry: `/analyze AAPL` or `/advise AAPL ENTRY=168.50 SHARES=120 RISK=balanced`",
-            parse_mode="Markdown"
+            text="⚠️ Send a ticker.\n/analyze AAPL\n/advise AAPL ENTRY=168.5 SHARES=120 RISK=balanced",
         )
         return {"status": "invalid"}
 
-    upper = text.upper()
-
-    # --- New: /ADVISE command ---
-    if upper.startswith("/ADVISE"):
-        try:
-            parts = text.split()
-            symbol = parts[1].upper()
-            kv = {p.split("=", 1)[0].upper(): p.split("=", 1)[1] for p in parts[2:] if "=" in p}
-            entry = float(kv.get("ENTRY"))
-            shares = int(float(kv.get("SHARES")))
-            risk = (kv.get("RISK", "balanced")).lower()
-
-            await bot.send_message(chat_id=chat_id,
-                                   text=f"🧮 Evaluating position {symbol} (entry ${entry}, shares {shares}, risk {risk})...")
-
-            advice = advise_position(symbol, entry, shares, risk)
-            chunks = format_advice_output(advice)
-            for i, part in enumerate(chunks, start=1):
-                await bot.send_message(chat_id=chat_id, text=f"({i}/{len(chunks)})\n{part}", parse_mode="Markdown")
-
+    try:
+        if cmd in (None, "ANALYZE"):
+            await bot.send_message(chat_id=chat_id, text=f"⏳ Analyzing {symbol}…")
+            market = get_stock_data(symbol)
+            news = get_news_data(symbol)
+            if "error" in market or "error" in news:
+                await bot.send_message(chat_id=chat_id, text="⚠️ Some upstream data failed; summarizing with what's available.")
+            panel = hedge_fund_agents(symbol, market, news)
+            panel_concat = " ".join([f"{k}: {v}" for k, v in panel.items()])
+            risk = risk_manager(panel_concat)
+            chunks = format_report(panel, risk, symbol)
+            await _send_chunks(chat_id, chunks)
             return {"status": "ok"}
 
-        except Exception as e:
-            await bot.send_message(
-                chat_id=chat_id,
-                text=("⚠️ Usage: `/advise TICKER ENTRY=123.45 SHARES=100 RISK=conservative|balanced|aggressive`\n"
-                      f"Error: {e}"),
-                parse_mode="Markdown"
-            )
-            return {"status": "bad_params"}
+        if cmd == "ADVISE":
+            entry = float(args.get("ENTRY")) if args.get("ENTRY") else None
+            shares = int(float(args.get("SHARES"))) if args.get("SHARES") else None
+            risk = (args.get("RISK") or "balanced").lower()
+            if entry is None or shares is None:
+                await bot.send_message(chat_id=chat_id, text="⚠️ Usage: /advise TICKER ENTRY=123.45 SHARES=100 RISK=balanced")
+                return {"status": "invalid"}
+            await bot.send_message(chat_id=chat_id, text=f"🤖 Evaluating {symbol} position…")
+            rec = advise_position(symbol, entry, shares, risk)
+            chunks = format_advice_output(rec)
+            await _send_chunks(chat_id, chunks)
+            return {"status": "ok"}
 
-    # --- Existing: /ANALYZE command ---
-    if upper.startswith("/ANALYZE"):
-        parts = text.split(" ", 1)
-        symbol = parts[1].strip().upper() if len(parts) > 1 else None
-        if not symbol:
-            await bot.send_message(chat_id=chat_id, text="⚠️ Please provide a ticker. Example: `/analyze AAPL`",
-                                   parse_mode="Markdown")
-            return {"status": "invalid"}
-
-        await bot.send_message(chat_id=chat_id, text=f"⏳ Running quarterly analysis for {symbol}...")
-
+        # Unknown command -> default to analyze
+        await bot.send_message(chat_id=chat_id, text=f"ℹ️ Unknown command `{cmd}`. Running /analyze {symbol}.")
         market = get_stock_data(symbol)
         news = get_news_data(symbol)
-        if "error" in market or "error" in news:
-            await bot.send_message(chat_id=chat_id, text="⚠️ Data fetch failed. Try another ticker or check API keys.")
-            return {"status": "fetch_failed"}
-
-        analysis = hedge_fund_agents(symbol, market, news)
-        riskrpt = risk_manager(analysis)
-        report_chunks = format_report(analysis, riskrpt)
-
-        if isinstance(report_chunks, list):
-            for i, part in enumerate(report_chunks, start=1):
-                await bot.send_message(chat_id=chat_id, text=f"({i}/{len(report_chunks)})\n{part}", parse_mode="Markdown")
-        else:
-            await bot.send_message(chat_id=chat_id, text=str(report_chunks)[:4000], parse_mode="Markdown")
-
-        print(f"✅ Completed analysis for {symbol}")
+        panel = hedge_fund_agents(symbol, market, news)
+        panel_concat = " ".join([f"{k}: {v}" for k, v in panel.items()])
+        risk = risk_manager(panel_concat)
+        chunks = format_report(panel, risk, symbol)
+        await _send_chunks(chat_id, chunks)
         return {"status": "ok"}
 
-    # Fallback: help text
-    await bot.send_message(
-        chat_id=chat_id,
-        text=(
-            "👋 Try:\n"
-            "• `/analyze AAPL` — quarterly research report\n"
-            "• `/advise AAPL ENTRY=168.50 SHARES=120 RISK=balanced` — Diversify/Hold/Exit with dollar allocations"
-        ),
-        parse_mode="Markdown"
-    )
-    return {"status": "help"}
-
+    except Exception as e:
+        print(f"[ERROR] {e}")
+        await bot.send_message(chat_id=chat_id, text=f"❌ Error: {e}")
+        return {"status": "error"}
 
 @app.get("/")
 async def home():
